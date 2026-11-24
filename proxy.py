@@ -32,7 +32,8 @@ CLIENT_TIMEOUT = 10                     # seconds to wait for the client's reque
 ORIGIN_TIMEOUT = 10                     # seconds to wait for the web server
 MAX_REQUEST_SIZE = 64 * 1024            # reject request headers larger than this
 MAX_CACHEABLE_SIZE = 5 * 1024 * 1024    # responses larger than 5 MB are not cached
-MAX_CACHE_ENTRIES = 100                 # the cache keeps at most this many responses
+MAX_CACHE_ENTRIES = 100                 # the cache keeps at most this many responses ...
+MAX_CACHE_BYTES = 100 * 1024 * 1024     # ... and at most this many bytes in total
 DEFAULT_TTL = 60                        # seconds a response stays fresh if the server gives no hint
 
 log = logging.getLogger("proxy")
@@ -89,23 +90,31 @@ class CacheEntry:
     """One stored response and the time until which it is fresh."""
 
     def __init__(self, status, reason, headers, body, expires_at):
-        self.status, self.reason, self.headers, self.body = status, reason, headers, body
+        self.status, self.reason, self.body = status, reason, body
         self.expires_at = expires_at
-        h = {k.lower(): v for k, v in headers}
+        self.set_headers(headers)
+
+    def set_headers(self, headers):
+        # A shared cache must never replay one user's Set-Cookie (e.g. a session id) to others
+        self.headers = [(k, v) for k, v in headers if k.lower() != "set-cookie"]
+        h = {k.lower(): v for k, v in self.headers}
         self.etag = h.get("etag")                       # used to revalidate a stale copy
         self.last_modified = h.get("last-modified")
+        self.size = len(self.body) + sum(len(k) + len(v) for k, v in self.headers)
 
     def is_fresh(self):
         return time.time() < self.expires_at
 
 
 class Cache:
-    """Cache keyed by URL. When it is full, the least recently used entry is removed.
+    """LRU cache keyed by URL, limited by number of entries and by total bytes.
     A lock protects it because every client runs in its own thread."""
 
-    def __init__(self, max_entries=MAX_CACHE_ENTRIES):
-        self.max_entries = max_entries
+    def __init__(self, max_entries=MAX_CACHE_ENTRIES, max_bytes=MAX_CACHE_BYTES):
+        self.max_entries, self.max_bytes = max_entries, max_bytes
         self._data = OrderedDict()
+        self._sizes = {}            # size each entry had when it was stored (entries can change later)
+        self.size_bytes = 0
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -117,15 +126,23 @@ class Cache:
 
     def put(self, key, entry):
         with self._lock:
+            self._remove(key)
             self._data[key] = entry
-            self._data.move_to_end(key)
-            if len(self._data) > self.max_entries:
-                evicted, _ = self._data.popitem(last=False)   # oldest entry
+            self._sizes[key] = entry.size
+            self.size_bytes += entry.size
+            while len(self._data) > 1 and (len(self._data) > self.max_entries
+                                           or self.size_bytes > self.max_bytes):
+                evicted = next(iter(self._data))        # least recently used
+                self._remove(evicted)
                 log.info("CACHE EVICT   %s", evicted)
 
     def discard(self, key):
         with self._lock:
-            self._data.pop(key, None)
+            self._remove(key)
+
+    def _remove(self, key):
+        if self._data.pop(key, None) is not None:
+            self.size_bytes -= self._sizes.pop(key)
 
     def __len__(self):
         return len(self._data)
@@ -157,11 +174,16 @@ def compute_expiry(headers):
         return None                                  # the server forbids storing it
     if "no-cache" in cc:
         return time.time()                           # store it, but revalidate before every use
-    if "max-age" in cc:
-        try:
-            return time.time() + max(0, int(cc["max-age"]))
-        except ValueError:
-            pass                                     # invalid number: ignore it
+    try:
+        age = max(0, int(h.get("age", "0")))         # seconds the copy already spent in other caches
+    except ValueError:
+        age = 0
+    for key in ("s-maxage", "max-age"):              # this is a shared cache, so s-maxage wins
+        if key in cc:
+            try:
+                return time.time() + max(0, int(cc[key]) - age)
+            except ValueError:
+                pass                                 # invalid number: ignore it
     if "expires" in h:
         try:
             expires = parsedate_to_datetime(h["expires"])
@@ -368,12 +390,18 @@ def handle_request(raw, cache, firewall):
     status, reason, headers, body = fetch_from_origin(host, port, path, validators)
 
     if status == 304 and validators:
-        # Not modified: keep our copy and give it the new lifetime from the 304 headers
-        expiry = compute_expiry(headers)
+        # Not modified: keep our body, but newer header values from the 304 replace the stored ones
+        merged = {k.lower(): (k, v) for k, v in entry.headers}
+        for k, v in headers:
+            if k.lower() not in SKIP_HEADERS:
+                merged[k.lower()] = (k, v)
+        entry.set_headers(list(merged.values()))
+        expiry = compute_expiry(entry.headers)
         if expiry is None:
-            cache.discard(url)
+            cache.discard(url)                       # the new headers forbid storing it
         else:
             entry.expires_at = expiry
+            cache.put(url, entry)                    # store again: its size may have changed
         log.info("CACHE HIT     %s (revalidated with 304 Not Modified)", url)
         return build_response(entry.status, entry.reason, entry.headers, entry.body,
                               "HIT (revalidated)")
