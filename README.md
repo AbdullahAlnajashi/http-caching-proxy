@@ -8,6 +8,11 @@ stale copies with `ETag` / `Last-Modified`, tunnels HTTPS with `CONNECT`, blocks
 and keeps running when clients or web servers misbehave. A companion client measures how much
 faster cached responses are.
 
+> **University project.** This started as a team project for a university computer networks
+> course (an HTTP proxy with caching, a firewall and error handling). It was later extended
+> beyond the course requirements with HTTPS tunnelling, shared-cache rules, chunked decoding,
+> loop detection, a client limit and a larger test suite.
+
 ## Features
 
 - **HTTP forwarding** – accepts `GET http://host/path` and forwards it to the web server
