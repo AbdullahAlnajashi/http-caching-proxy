@@ -570,6 +570,102 @@ class ErrorHandlingTests(ProxyTestCase):
         self.alive()
 
 
+class EchoServer:
+    """Plain TCP server that sends back whatever it receives (stands in for an HTTPS site)."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.sock.listen(20)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.echo, args=(c,), daemon=True).start()
+
+    def echo(self, c):
+        try:
+            while True:
+                data = c.recv(65536)
+                if not data:
+                    break
+                c.sendall(data)
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+
+class TunnelTests(ProxyTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.echo = EchoServer()
+        cls.closed_port = free_port()                  # nothing listens here
+        proxy.CONNECT_PORTS = {443, cls.echo.port, cls.closed_port}
+
+    def open_tunnel(self, target, extra=b""):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode() + extra)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(1)
+            if not chunk:
+                break
+            head += chunk
+        return s, parse(head)[0]
+
+    def connect_status(self, target):
+        s, status = self.open_tunnel(target)
+        s.close()
+        return status
+
+    def test_tunnel_relays_bytes_both_ways(self):
+        s, status = self.open_tunnel(f"127.0.0.1:{self.echo.port}", extra=b"early ")
+        self.assertEqual(status, 200)
+        s.sendall(b"ping")
+        got = b""
+        while len(got) < 10:
+            got += s.recv(100)
+        self.assertEqual(got, b"early ping")            # bytes sent with the CONNECT are not lost
+        s.close()
+        time.sleep(0.3)
+        self.assertTrue(any(l.startswith("TUNNEL") for l in self.logs.lines))
+        self.alive()
+
+    def test_tunnel_carries_large_data(self):
+        s, status = self.open_tunnel(f"127.0.0.1:{self.echo.port}")
+        self.assertEqual(status, 200)
+        data = os.urandom(2 * 1024 * 1024)
+        threading.Thread(target=s.sendall, args=(data,), daemon=True).start()
+        got = bytearray()
+        while len(got) < len(data):
+            got += s.recv(65536)
+        self.assertEqual(bytes(got), data)
+        s.close()
+
+    def test_tunnel_errors(self):
+        self.assertEqual(self.connect_status("blocked.test:443"), 403)
+        self.assertEqual(self.connect_status("www.blocked.test.:443"), 403)
+        self.assertEqual(self.connect_status("127.0.0.1:25"), 403)                 # only allowed ports
+        self.assertEqual(self.connect_status("nohost"), 400)
+        self.assertEqual(self.connect_status("no-such-host.invalid:443"), 502)
+        self.assertEqual(self.connect_status(f"127.0.0.1:{self.closed_port}"), 502)
+        self.assertEqual(self.connect_status(f"127.0.0.1:{self.port}"), 508)       # the proxy itself
+        self.alive()
+
+    def test_client_https_through_blocked_tunnel(self):
+        r = client.fetch("https://blocked.test/", "127.0.0.1", self.port)
+        self.assertEqual((r["status"], r["cache"]), (403, "BLOCKED"))
+        self.assertEqual(client.describe_source("TUNNEL"),
+                         "HTTPS TUNNEL (encrypted end to end, never cached)")
+
+
 class ConcurrencyTests(ProxyTestCase):
     def test_client_limit_returns_503_then_recovers(self):
         port = free_port()
@@ -623,7 +719,7 @@ class ClientTests(ProxyTestCase):
         self.assertEqual(client.fetch("http://x.invalid/", "127.0.0.1", self.port)["cache"], "ERROR")
 
     def test_client_rejects_bad_urls(self):
-        for url in ("example.com", "https://example.com", "ftp://x/", "http://", ""):
+        for url in ("example.com", "ftp://x/", "http://", "https://", ""):
             with self.assertRaises(ValueError, msg=url):
                 client.fetch(url, "127.0.0.1", self.port)
 

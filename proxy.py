@@ -20,6 +20,7 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
@@ -39,6 +40,8 @@ MAX_CACHE_BYTES = 100 * 1024 * 1024     # ... and at most this many bytes in tot
 DEFAULT_TTL = 60                        # seconds a response stays fresh if the server gives no hint
 MAX_CLIENTS = 100                       # connections served at the same time (others get 503)
 VIA_TOKEN = "CachingProxy"              # added to forwarded requests; seeing it again means a loop
+CONNECT_PORTS = {443}                   # HTTPS tunnels may only go to these ports
+TUNNEL_IDLE_TIMEOUT = 120               # close a tunnel direction after this many idle seconds
 
 log = logging.getLogger("proxy")
 
@@ -236,7 +239,7 @@ def parse_request(raw):
             headers[k.strip().lower()] = v.strip()
 
     if url.lower().startswith("https://"):
-        raise ProxyError(501, "Not Implemented", "HTTPS is not supported by this proxy")
+        raise ProxyError(501, "Not Implemented", "Send https:// requests through a CONNECT tunnel")
     if not url.lower().startswith("http://"):
         raise ProxyError(400, "Bad Request", "Request target must be an absolute http:// URL")
 
@@ -341,21 +344,30 @@ def fetch_from_origin(host, port, path, validators=None):
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
 
     deadline = time.monotonic() + ORIGIN_TOTAL_TIMEOUT
+    with origin_errors(host, port), \
+            socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT) as s:
+        s.sendall(request)
+        raw = bytearray()
+        while True:                          # read until the server closes the connection
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:               # a server sending one byte at a time must not
+                raise socket.timeout()       # hold this thread forever
+            s.settimeout(min(ORIGIN_TIMEOUT, remaining))
+            chunk = s.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > MAX_RESPONSE_SIZE:
+                raise ProxyError(502, "Bad Gateway", "Origin response too large")
+    return parse_response(bytes(raw))
+
+
+@contextmanager
+def origin_errors(host, port):
+    """Turn a network failure while talking to a web server into a ProxyError
+    with the matching HTTP status (used for both GET and CONNECT)."""
     try:
-        with socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT) as s:
-            s.sendall(request)
-            raw = bytearray()
-            while True:                      # read until the server closes the connection
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:           # a server sending one byte at a time must not
-                    raise socket.timeout()   # hold this thread forever
-                s.settimeout(min(ORIGIN_TIMEOUT, remaining))
-                chunk = s.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                raw += chunk
-                if len(raw) > MAX_RESPONSE_SIZE:
-                    raise ProxyError(502, "Bad Gateway", "Origin response too large")
+        yield
     except socket.gaierror:
         raise ProxyError(502, "Bad Gateway", f"DNS lookup failed for {host}")
     except socket.timeout:
@@ -364,7 +376,81 @@ def fetch_from_origin(host, port, path, validators=None):
         raise ProxyError(502, "Bad Gateway", f"Connection refused by {host}:{port}")
     except OSError as e:
         raise ProxyError(502, "Bad Gateway", f"Network error: {e}")
-    return parse_response(bytes(raw))
+
+
+# ----------------------------------------------------------------------------
+# HTTPS: CONNECT tunnels
+# ----------------------------------------------------------------------------
+def parse_connect(raw):
+    """'CONNECT example.com:443 HTTP/1.1' -> ('example.com', 443)"""
+    try:
+        method, target, version = raw.split(b"\r\n", 1)[0].decode("iso-8859-1").split()
+    except ValueError:
+        raise ProxyError(400, "Bad Request", "Malformed request line")
+    if not version.startswith("HTTP/"):
+        raise ProxyError(400, "Bad Request", "Missing HTTP version")
+    try:
+        parts = urlsplit("//" + target)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise ProxyError(400, "Bad Request", "Invalid host or port in CONNECT target")
+    if not host or port is None or not 1 <= port <= 65535:
+        raise ProxyError(400, "Bad Request", "CONNECT target must look like host:port")
+    return host, port
+
+
+def pump(src, dst, counts, key):
+    """Copy bytes from src to dst until src closes, then tell dst no more data is coming."""
+    try:
+        while True:
+            data = src.recv(BUFFER_SIZE)
+            if not data:
+                break
+            dst.sendall(data)
+            counts[key] += len(data)
+    except OSError:                                 # reset, timeout or closed: end this direction
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def handle_connect(conn, raw, firewall, listen):
+    """Open a TCP tunnel for HTTPS. The proxy cannot read or cache encrypted traffic, so after
+    '200 Connection Established' it only copies bytes in both directions until both sides close.
+    Raises ProxyError (sent to the client as an error page) only before the tunnel is open."""
+    host, port = parse_connect(raw)
+    target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    if is_self(host, port, listen):
+        raise ProxyError(508, "Loop Detected", "The proxy cannot open a tunnel to itself.")
+    if firewall.is_blocked(host):
+        log.warning("BLOCKED      CONNECT %s", target)
+        raise ProxyError(403, "Forbidden", f"Access to {host} is blocked by the proxy firewall.")
+    if port not in CONNECT_PORTS:                   # do not become an open relay to mail servers etc.
+        raise ProxyError(403, "Forbidden", f"Tunnels are allowed only to port(s) {sorted(CONNECT_PORTS)}")
+
+    with origin_errors(host, port):
+        upstream = socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT)
+    with upstream:
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: CachingProxy/1.0\r\n\r\n")
+        log.info("TUNNEL        %s", target)
+        counts = {"up": 0, "down": 0}
+        early = raw.split(b"\r\n\r\n", 1)[1]        # bytes the client sent right after CONNECT
+        try:
+            if early:
+                upstream.sendall(early)
+                counts["up"] += len(early)
+        except OSError:
+            pass
+        for s in (conn, upstream):
+            s.settimeout(TUNNEL_IDLE_TIMEOUT)
+        down = threading.Thread(target=pump, args=(upstream, conn, counts, "down"), daemon=True)
+        down.start()
+        pump(conn, upstream, counts, "up")          # this thread copies client -> server
+        down.join()
+    log.info("TUNNEL CLOSED %s (%d bytes up, %d bytes down)", target, counts["up"], counts["down"])
 
 
 # ----------------------------------------------------------------------------
@@ -516,6 +602,9 @@ def client_thread(conn, addr, cache, firewall, limit, listen):
         if not raw.strip():
             return                                    # the client connected and left
         try:
+            if raw[:8].upper() == b"CONNECT ":            # HTTPS: open a tunnel instead
+                handle_connect(conn, raw, firewall, listen)
+                return
             response = handle_request(raw, cache, firewall, listen)
         except ProxyError as e:                       # expected errors: send an error page
             if e.status != 403:
