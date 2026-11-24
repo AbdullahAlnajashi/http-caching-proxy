@@ -29,8 +29,10 @@ from urllib.parse import urlsplit
 # ----------------------------------------------------------------------------
 BUFFER_SIZE = 65536
 CLIENT_TIMEOUT = 10                     # seconds to wait for the client's request
-ORIGIN_TIMEOUT = 10                     # seconds to wait for the web server
+ORIGIN_TIMEOUT = 10                     # seconds to wait for each piece of the web server's answer
+ORIGIN_TOTAL_TIMEOUT = 30               # seconds for the whole answer (stops slow-drip servers)
 MAX_REQUEST_SIZE = 64 * 1024            # reject request headers larger than this
+MAX_RESPONSE_SIZE = 20 * 1024 * 1024    # never read more than 20 MB from a web server
 MAX_CACHEABLE_SIZE = 5 * 1024 * 1024    # responses larger than 5 MB are not cached
 MAX_CACHE_ENTRIES = 100                 # the cache keeps at most this many responses ...
 MAX_CACHE_BYTES = 100 * 1024 * 1024     # ... and at most this many bytes in total
@@ -257,6 +259,26 @@ def host_port(host, port):
     return name if port == 80 else f"{name}:{port}"
 
 
+def decode_chunked(body):
+    """Decode a Transfer-Encoding: chunked body: each chunk is '<hex size>\\r\\n<data>\\r\\n',
+    and a chunk of size 0 ends the body. Raises ValueError if it is malformed or cut short."""
+    out, pos = bytearray(), 0
+    while True:
+        eol = body.find(b"\r\n", pos)
+        if eol == -1:
+            raise ValueError("truncated chunked body")
+        size = int(body[pos:eol].split(b";")[0].strip(), 16)      # ';' starts chunk extensions
+        if size < 0:
+            raise ValueError("negative chunk size")
+        if size == 0:
+            return bytes(out)
+        end = eol + 2 + size
+        if end + 2 > len(body) or body[end:end + 2] != b"\r\n":
+            raise ValueError("truncated or malformed chunk")
+        out += body[eol + 2:end]
+        pos = end + 2
+
+
 def parse_response(raw):
     """Split the web server's answer into (status, reason, headers, body) and check it."""
     end = raw.find(b"\r\n\r\n")
@@ -279,8 +301,11 @@ def parse_response(raw):
     if status == 304:
         body = b""                                     # 304 Not Modified has no body
     elif "chunked" in h.get("transfer-encoding", "").lower():
-        # We ask for HTTP/1.0, so a correct server never sends a chunked body
-        raise ProxyError(502, "Bad Gateway", "Origin sent a chunked body, which is not supported")
+        # We ask for HTTP/1.0, but some servers answer with HTTP/1.1 chunked encoding anyway
+        try:
+            body = decode_chunked(body)
+        except ValueError:
+            raise ProxyError(502, "Bad Gateway", "Origin sent a malformed chunked body")
     elif "content-length" in h:
         try:
             expected = int(h["content-length"])
@@ -312,15 +337,22 @@ def fetch_from_origin(host, port, path, validators=None):
         lines.append(f"{k}: {v}")
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
 
+    deadline = time.monotonic() + ORIGIN_TOTAL_TIMEOUT
     try:
         with socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT) as s:
             s.sendall(request)
             raw = bytearray()
             while True:                      # read until the server closes the connection
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:           # a server sending one byte at a time must not
+                    raise socket.timeout()   # hold this thread forever
+                s.settimeout(min(ORIGIN_TIMEOUT, remaining))
                 chunk = s.recv(BUFFER_SIZE)
                 if not chunk:
                     break
                 raw += chunk
+                if len(raw) > MAX_RESPONSE_SIZE:
+                    raise ProxyError(502, "Bad Gateway", "Origin response too large")
     except socket.gaierror:
         raise ProxyError(502, "Bad Gateway", f"DNS lookup failed for {host}")
     except socket.timeout:

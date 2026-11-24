@@ -27,6 +27,7 @@ import proxy
 # Short timeouts so the tests run fast (the real values are in proxy.py)
 proxy.CLIENT_TIMEOUT = 2
 proxy.ORIGIN_TIMEOUT = 2.5
+proxy.ORIGIN_TOTAL_TIMEOUT = 3
 
 
 def free_port():
@@ -114,7 +115,17 @@ class Origin:
             elif path == "/truncated":
                 send(b"HTTP/1.0 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 1000\r\n\r\n0123456789")
             elif path == "/chunked":
-                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nCache-Control: max-age=60\r\n\r\n"
+                     b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+            elif path == "/badchunk":
+                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nhello\r\n0\r\n\r\n")
+            elif path == "/cutchunk":
+                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+            elif path == "/drip":                # one byte every 1.5 s: never silent, never done
+                send(b"HTTP/1.0 200 OK\r\n\r\n")
+                for _ in range(20):
+                    send(b"a")
+                    time.sleep(1.5)
             elif path == "/garbage":
                 send(b"this is not http at all")
             elif path == "/nostatus":
@@ -478,9 +489,31 @@ class ErrorHandlingTests(ProxyTestCase):
         self.alive()
 
     def test_bad_origin_responses_are_502_and_not_cached(self):
-        for p in ("/truncated", "/chunked", "/garbage", "/nostatus"):
+        for p in ("/truncated", "/badchunk", "/cutchunk", "/garbage", "/nostatus"):
             self.assertEqual(self.get(p + "?a=1")[0], 502, p)
             self.assertEqual(self.get(p + "?a=1")[0], 502, p + " (second time)")
+        self.alive()
+
+    def test_chunked_origin_is_decoded_and_cached(self):
+        s, h, b = self.get("/chunked?a=1")
+        self.assertEqual((s, b), (200, b"hello world"))
+        self.assertFalse(any(k.lower() == "transfer-encoding" for k, _ in h))
+        s, h, b = self.get("/chunked?a=1")
+        self.assertEqual((xcache(h), b), ("HIT", b"hello world"))
+
+    def test_slow_drip_origin_gets_504_in_time(self):
+        t = time.time()
+        self.assertEqual(self.get("/drip?a=1")[0], 504)
+        self.assertLess(time.time() - t, proxy.ORIGIN_TOTAL_TIMEOUT + 2)
+        self.alive()
+
+    def test_response_over_size_limit_is_502(self):
+        old = proxy.MAX_RESPONSE_SIZE if hasattr(proxy, "MAX_RESPONSE_SIZE") else None
+        proxy.MAX_RESPONSE_SIZE = 1024 * 1024
+        try:
+            self.assertEqual(self.get("/medium?limit=1")[0], 502)          # 4 MB > 1 MB limit
+        finally:
+            proxy.MAX_RESPONSE_SIZE = old
         self.alive()
 
     def test_silent_origin_gets_504(self):
