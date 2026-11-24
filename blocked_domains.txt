@@ -1,0 +1,5 @@
+# Firewall rules: one domain per line. Sub-domains are blocked too.
+# Lines starting with # are comments.
+blocked.example
+facebook.com
+tiktok.com
