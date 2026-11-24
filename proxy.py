@@ -3,12 +3,14 @@
 HTTP Proxy Server with Caching and Firewall
 -------------------------------------------
 Features
-  * Handles HTTP GET requests sent by a client to the proxy (GET http://host/path HTTP/1.1)
-  * In-memory cache driven by HTTP headers (Cache-Control, Expires, ETag, Last-Modified),
-    with revalidation of stale copies (If-None-Match / If-Modified-Since -> 304 Not Modified)
+  * Forwards HTTP GET requests (GET http://host/path HTTP/1.1) and tunnels HTTPS (CONNECT host:443)
+  * Shared cache driven by HTTP headers (Cache-Control incl. s-maxage, Age, Expires, ETag,
+    Last-Modified), LRU-bounded by entries and bytes, with revalidation of stale copies
+    (If-None-Match / If-Modified-Since -> 304 Not Modified); Set-Cookie is never stored
   * Firewall: blocks the domains listed in blocked_domains.txt with 403 Forbidden
-  * Logs every CACHE HIT / CACHE MISS / BLOCKED / ERROR to the console and to proxy.log
-  * Exception handling: an error in one request never stops the proxy
+  * Logs every CACHE HIT / CACHE MISS / BLOCKED / TUNNEL / ERROR to the console and to proxy.log
+  * Robust: chunked decoding, transfer deadline and size cap, loop detection, a client limit
+    (503), and an error in one request never stops the proxy
 
 Usage:  python proxy.py [--host 127.0.0.1] [--port 8888] [--blocked blocked_domains.txt]
 """
@@ -20,6 +22,7 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
@@ -29,11 +32,18 @@ from urllib.parse import urlsplit
 # ----------------------------------------------------------------------------
 BUFFER_SIZE = 65536
 CLIENT_TIMEOUT = 10                     # seconds to wait for the client's request
-ORIGIN_TIMEOUT = 10                     # seconds to wait for the web server
+ORIGIN_TIMEOUT = 10                     # seconds to wait for each piece of the web server's answer
+ORIGIN_TOTAL_TIMEOUT = 30               # seconds for the whole answer (stops slow-drip servers)
 MAX_REQUEST_SIZE = 64 * 1024            # reject request headers larger than this
+MAX_RESPONSE_SIZE = 20 * 1024 * 1024    # never read more than 20 MB from a web server
 MAX_CACHEABLE_SIZE = 5 * 1024 * 1024    # responses larger than 5 MB are not cached
-MAX_CACHE_ENTRIES = 100                 # the cache keeps at most this many responses
+MAX_CACHE_ENTRIES = 100                 # the cache keeps at most this many responses ...
+MAX_CACHE_BYTES = 100 * 1024 * 1024     # ... and at most this many bytes in total
 DEFAULT_TTL = 60                        # seconds a response stays fresh if the server gives no hint
+MAX_CLIENTS = 100                       # connections served at the same time (others get 503)
+VIA_TOKEN = "CachingProxy"              # added to forwarded requests; seeing it again means a loop
+CONNECT_PORTS = {443}                   # HTTPS tunnels may only go to these ports
+TUNNEL_IDLE_TIMEOUT = 120               # close a tunnel direction after this many idle seconds
 
 log = logging.getLogger("proxy")
 
@@ -89,23 +99,31 @@ class CacheEntry:
     """One stored response and the time until which it is fresh."""
 
     def __init__(self, status, reason, headers, body, expires_at):
-        self.status, self.reason, self.headers, self.body = status, reason, headers, body
+        self.status, self.reason, self.body = status, reason, body
         self.expires_at = expires_at
-        h = {k.lower(): v for k, v in headers}
+        self.set_headers(headers)
+
+    def set_headers(self, headers):
+        # A shared cache must never replay one user's Set-Cookie (e.g. a session id) to others
+        self.headers = [(k, v) for k, v in headers if k.lower() != "set-cookie"]
+        h = {k.lower(): v for k, v in self.headers}
         self.etag = h.get("etag")                       # used to revalidate a stale copy
         self.last_modified = h.get("last-modified")
+        self.size = len(self.body) + sum(len(k) + len(v) for k, v in self.headers)
 
     def is_fresh(self):
         return time.time() < self.expires_at
 
 
 class Cache:
-    """Cache keyed by URL. When it is full, the least recently used entry is removed.
+    """LRU cache keyed by URL, limited by number of entries and by total bytes.
     A lock protects it because every client runs in its own thread."""
 
-    def __init__(self, max_entries=MAX_CACHE_ENTRIES):
-        self.max_entries = max_entries
+    def __init__(self, max_entries=MAX_CACHE_ENTRIES, max_bytes=MAX_CACHE_BYTES):
+        self.max_entries, self.max_bytes = max_entries, max_bytes
         self._data = OrderedDict()
+        self._sizes = {}            # size each entry had when it was stored (entries can change later)
+        self.size_bytes = 0
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -117,15 +135,23 @@ class Cache:
 
     def put(self, key, entry):
         with self._lock:
+            self._remove(key)
             self._data[key] = entry
-            self._data.move_to_end(key)
-            if len(self._data) > self.max_entries:
-                evicted, _ = self._data.popitem(last=False)   # oldest entry
+            self._sizes[key] = entry.size
+            self.size_bytes += entry.size
+            while len(self._data) > 1 and (len(self._data) > self.max_entries
+                                           or self.size_bytes > self.max_bytes):
+                evicted = next(iter(self._data))        # least recently used
+                self._remove(evicted)
                 log.info("CACHE EVICT   %s", evicted)
 
     def discard(self, key):
         with self._lock:
-            self._data.pop(key, None)
+            self._remove(key)
+
+    def _remove(self, key):
+        if self._data.pop(key, None) is not None:
+            self.size_bytes -= self._sizes.pop(key)
 
     def __len__(self):
         return len(self._data)
@@ -157,11 +183,16 @@ def compute_expiry(headers):
         return None                                  # the server forbids storing it
     if "no-cache" in cc:
         return time.time()                           # store it, but revalidate before every use
-    if "max-age" in cc:
-        try:
-            return time.time() + max(0, int(cc["max-age"]))
-        except ValueError:
-            pass                                     # invalid number: ignore it
+    try:
+        age = max(0, int(h.get("age", "0")))         # seconds the copy already spent in other caches
+    except ValueError:
+        age = 0
+    for key in ("s-maxage", "max-age"):              # this is a shared cache, so s-maxage wins
+        if key in cc:
+            try:
+                return time.time() + max(0, int(cc[key]) - age)
+            except ValueError:
+                pass                                 # invalid number: ignore it
     if "expires" in h:
         try:
             expires = parsedate_to_datetime(h["expires"])
@@ -210,7 +241,7 @@ def parse_request(raw):
             headers[k.strip().lower()] = v.strip()
 
     if url.lower().startswith("https://"):
-        raise ProxyError(501, "Not Implemented", "HTTPS is not supported by this proxy")
+        raise ProxyError(501, "Not Implemented", "Send https:// requests through a CONNECT tunnel")
     if not url.lower().startswith("http://"):
         raise ProxyError(400, "Bad Request", "Request target must be an absolute http:// URL")
 
@@ -235,6 +266,26 @@ def host_port(host, port):
     return name if port == 80 else f"{name}:{port}"
 
 
+def decode_chunked(body):
+    """Decode a Transfer-Encoding: chunked body: each chunk is '<hex size>\\r\\n<data>\\r\\n',
+    and a chunk of size 0 ends the body. Raises ValueError if it is malformed or cut short."""
+    out, pos = bytearray(), 0
+    while True:
+        eol = body.find(b"\r\n", pos)
+        if eol == -1:
+            raise ValueError("truncated chunked body")
+        size = int(body[pos:eol].split(b";")[0].strip(), 16)      # ';' starts chunk extensions
+        if size < 0:
+            raise ValueError("negative chunk size")
+        if size == 0:
+            return bytes(out)
+        end = eol + 2 + size
+        if end + 2 > len(body) or body[end:end + 2] != b"\r\n":
+            raise ValueError("truncated or malformed chunk")
+        out += body[eol + 2:end]
+        pos = end + 2
+
+
 def parse_response(raw):
     """Split the web server's answer into (status, reason, headers, body) and check it."""
     end = raw.find(b"\r\n\r\n")
@@ -257,8 +308,11 @@ def parse_response(raw):
     if status == 304:
         body = b""                                     # 304 Not Modified has no body
     elif "chunked" in h.get("transfer-encoding", "").lower():
-        # We ask for HTTP/1.0, so a correct server never sends a chunked body
-        raise ProxyError(502, "Bad Gateway", "Origin sent a chunked body, which is not supported")
+        # We ask for HTTP/1.0, but some servers answer with HTTP/1.1 chunked encoding anyway
+        try:
+            body = decode_chunked(body)
+        except ValueError:
+            raise ProxyError(502, "Bad Gateway", "Origin sent a malformed chunked body")
     elif "content-length" in h:
         try:
             expected = int(h["content-length"])
@@ -284,21 +338,38 @@ def fetch_from_origin(host, port, path, validators=None):
         "User-Agent: CachingProxy/1.0",
         "Accept: */*",
         "Accept-Encoding: identity",         # no compression, so the body stays readable
+        f"Via: 1.1 {VIA_TOKEN}",             # lets a proxy loop be detected
         "Connection: close",
     ]
     for k, v in (validators or {}).items():
         lines.append(f"{k}: {v}")
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
 
+    deadline = time.monotonic() + ORIGIN_TOTAL_TIMEOUT
+    with origin_errors(host, port), \
+            socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT) as s:
+        s.sendall(request)
+        raw = bytearray()
+        while True:                          # read until the server closes the connection
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:               # a server sending one byte at a time must not
+                raise socket.timeout()       # hold this thread forever
+            s.settimeout(min(ORIGIN_TIMEOUT, remaining))
+            chunk = s.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > MAX_RESPONSE_SIZE:
+                raise ProxyError(502, "Bad Gateway", "Origin response too large")
+    return parse_response(bytes(raw))
+
+
+@contextmanager
+def origin_errors(host, port):
+    """Turn a network failure while talking to a web server into a ProxyError
+    with the matching HTTP status (used for both GET and CONNECT)."""
     try:
-        with socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT) as s:
-            s.sendall(request)
-            raw = bytearray()
-            while True:                      # read until the server closes the connection
-                chunk = s.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                raw += chunk
+        yield
     except socket.gaierror:
         raise ProxyError(502, "Bad Gateway", f"DNS lookup failed for {host}")
     except socket.timeout:
@@ -307,7 +378,81 @@ def fetch_from_origin(host, port, path, validators=None):
         raise ProxyError(502, "Bad Gateway", f"Connection refused by {host}:{port}")
     except OSError as e:
         raise ProxyError(502, "Bad Gateway", f"Network error: {e}")
-    return parse_response(bytes(raw))
+
+
+# ----------------------------------------------------------------------------
+# HTTPS: CONNECT tunnels
+# ----------------------------------------------------------------------------
+def parse_connect(raw):
+    """'CONNECT example.com:443 HTTP/1.1' -> ('example.com', 443)"""
+    try:
+        method, target, version = raw.split(b"\r\n", 1)[0].decode("iso-8859-1").split()
+    except ValueError:
+        raise ProxyError(400, "Bad Request", "Malformed request line")
+    if not version.startswith("HTTP/"):
+        raise ProxyError(400, "Bad Request", "Missing HTTP version")
+    try:
+        parts = urlsplit("//" + target)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise ProxyError(400, "Bad Request", "Invalid host or port in CONNECT target")
+    if not host or port is None or not 1 <= port <= 65535:
+        raise ProxyError(400, "Bad Request", "CONNECT target must look like host:port")
+    return host, port
+
+
+def pump(src, dst, counts, key):
+    """Copy bytes from src to dst until src closes, then tell dst no more data is coming."""
+    try:
+        while True:
+            data = src.recv(BUFFER_SIZE)
+            if not data:
+                break
+            dst.sendall(data)
+            counts[key] += len(data)
+    except OSError:                                 # reset, timeout or closed: end this direction
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def handle_connect(conn, raw, firewall, listen):
+    """Open a TCP tunnel for HTTPS. The proxy cannot read or cache encrypted traffic, so after
+    '200 Connection Established' it only copies bytes in both directions until both sides close.
+    Raises ProxyError (sent to the client as an error page) only before the tunnel is open."""
+    host, port = parse_connect(raw)
+    target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    if is_self(host, port, listen):
+        raise ProxyError(508, "Loop Detected", "The proxy cannot open a tunnel to itself.")
+    if firewall.is_blocked(host):
+        log.warning("BLOCKED      CONNECT %s", target)
+        raise ProxyError(403, "Forbidden", f"Access to {host} is blocked by the proxy firewall.")
+    if port not in CONNECT_PORTS:                   # do not become an open relay to mail servers etc.
+        raise ProxyError(403, "Forbidden", f"Tunnels are allowed only to port(s) {sorted(CONNECT_PORTS)}")
+
+    with origin_errors(host, port):
+        upstream = socket.create_connection((host, port), timeout=ORIGIN_TIMEOUT)
+    with upstream:
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: CachingProxy/1.0\r\n\r\n")
+        log.info("TUNNEL        %s", target)
+        counts = {"up": 0, "down": 0}
+        early = raw.split(b"\r\n\r\n", 1)[1]        # bytes the client sent right after CONNECT
+        try:
+            if early:
+                upstream.sendall(early)
+                counts["up"] += len(early)
+        except OSError:
+            pass
+        for s in (conn, upstream):
+            s.settimeout(TUNNEL_IDLE_TIMEOUT)
+        down = threading.Thread(target=pump, args=(upstream, conn, counts, "down"), daemon=True)
+        down.start()
+        pump(conn, upstream, counts, "up")          # this thread copies client -> server
+        down.join()
+    log.info("TUNNEL CLOSED %s (%d bytes up, %d bytes down)", target, counts["up"], counts["down"])
 
 
 # ----------------------------------------------------------------------------
@@ -339,9 +484,19 @@ def error_response(status, reason, detail=""):
 # ----------------------------------------------------------------------------
 # Handling one request
 # ----------------------------------------------------------------------------
-def handle_request(raw, cache, firewall):
-    """Return the bytes to send back to the client. Raises ProxyError on failure."""
+def is_self(host, port, listen):
+    """True if host:port is this proxy's own listening address."""
+    return port == listen[1] and host in {"localhost", "127.0.0.1", "::1", listen[0].lower()}
+
+
+def handle_request(raw, cache, firewall, listen=("127.0.0.1", 8888)):
+    """Return the bytes to send back to the client. Raises ProxyError on failure.
+    `listen` is the proxy's own (host, port), used to refuse requests that would loop."""
     url, host, port, path, req_headers = parse_request(raw)
+
+    # 0) Loop protection: a request for the proxy itself, or one this proxy already forwarded
+    if is_self(host, port, listen) or VIA_TOKEN.lower() in req_headers.get("via", "").lower():
+        raise ProxyError(508, "Loop Detected", "The proxy cannot forward a request to itself.")
 
     # 1) Firewall: blocked sites are never contacted and never served from the cache
     if firewall.is_blocked(host):
@@ -368,12 +523,18 @@ def handle_request(raw, cache, firewall):
     status, reason, headers, body = fetch_from_origin(host, port, path, validators)
 
     if status == 304 and validators:
-        # Not modified: keep our copy and give it the new lifetime from the 304 headers
-        expiry = compute_expiry(headers)
+        # Not modified: keep our body, but newer header values from the 304 replace the stored ones
+        merged = {k.lower(): (k, v) for k, v in entry.headers}
+        for k, v in headers:
+            if k.lower() not in SKIP_HEADERS:
+                merged[k.lower()] = (k, v)
+        entry.set_headers(list(merged.values()))
+        expiry = compute_expiry(entry.headers)
         if expiry is None:
-            cache.discard(url)
+            cache.discard(url)                       # the new headers forbid storing it
         else:
             entry.expires_at = expiry
+            cache.put(url, entry)                    # store again: its size may have changed
         log.info("CACHE HIT     %s (revalidated with 304 Not Modified)", url)
         return build_response(entry.status, entry.reason, entry.headers, entry.body,
                               "HIT (revalidated)")
@@ -392,7 +553,44 @@ def handle_request(raw, cache, firewall):
     return build_response(status, reason, headers, body, "MISS (bypass)" if bypass else "MISS")
 
 
-def client_thread(conn, addr, cache, firewall):
+def graceful_close(conn):
+    """Close without destroying the reply we just sent.
+    Closing a socket that still holds unread client data makes TCP send a reset (RST), which can
+    wipe the reply from the client's buffer. So: send FIN, drain what is left (bounded), then close."""
+    try:
+        conn.shutdown(socket.SHUT_WR)
+        deadline, drained = time.monotonic() + 0.5, 0
+        while drained < 1024 * 1024 and time.monotonic() < deadline:
+            conn.settimeout(max(0.05, deadline - time.monotonic()))
+            chunk = conn.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            drained += len(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def refuse(conn):
+    """Answer 503 to a client we have no capacity for (runs in its own short-lived thread)."""
+    try:
+        conn.settimeout(1)
+        try:
+            conn.recv(BUFFER_SIZE)                    # read the request first so closing does not RST
+        except OSError:
+            pass
+        conn.sendall(error_response(503, "Service Unavailable", "Proxy is busy, try again."))
+    except OSError:
+        pass
+    finally:
+        graceful_close(conn)
+
+
+def client_thread(conn, addr, cache, firewall, limit, listen):
     """One thread per client connection. Every exception is caught here,
     so a bad request or a network error never stops the proxy."""
     try:
@@ -406,7 +604,10 @@ def client_thread(conn, addr, cache, firewall):
         if not raw.strip():
             return                                    # the client connected and left
         try:
-            response = handle_request(raw, cache, firewall)
+            if raw[:8].upper() == b"CONNECT ":            # HTTPS: open a tunnel instead
+                handle_connect(conn, raw, firewall, listen)
+                return
+            response = handle_request(raw, cache, firewall, listen)
         except ProxyError as e:                       # expected errors: send an error page
             if e.status != 403:
                 log.error("ERROR %d      %s from %s", e.status, e.detail or e.reason, addr[0])
@@ -426,11 +627,13 @@ def client_thread(conn, addr, cache, firewall):
     except Exception as e:
         log.exception("UNEXPECTED ERROR in client thread: %s", e)
     finally:
-        conn.close()                                  # always close the client socket
+        graceful_close(conn)                          # always close the client socket
+        limit.release()                               # free this client's slot
 
 
-def serve(host, port, blocked_file):
+def serve(host, port, blocked_file, max_clients=None):
     cache, firewall = Cache(), Firewall(blocked_file)
+    limit = threading.BoundedSemaphore(max_clients or MAX_CLIENTS)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         server.bind((host, port))
@@ -446,7 +649,11 @@ def serve(host, port, blocked_file):
                 conn, addr = server.accept()
             except socket.timeout:
                 continue
-            threading.Thread(target=client_thread, args=(conn, addr, cache, firewall),
+            if not limit.acquire(blocking=False):     # too many clients: answer 503 instead
+                threading.Thread(target=refuse, args=(conn,), daemon=True).start()
+                continue
+            threading.Thread(target=client_thread,
+                             args=(conn, addr, cache, firewall, limit, (host, port)),
                              daemon=True).start()
     except KeyboardInterrupt:
         log.info("Shutting down (cache held %d entries)", len(cache))

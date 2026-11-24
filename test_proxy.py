@@ -27,6 +27,7 @@ import proxy
 # Short timeouts so the tests run fast (the real values are in proxy.py)
 proxy.CLIENT_TIMEOUT = 2
 proxy.ORIGIN_TIMEOUT = 2.5
+proxy.ORIGIN_TOTAL_TIMEOUT = 3
 
 
 def free_port():
@@ -44,6 +45,7 @@ class Origin:
     def __init__(self):
         self.port = free_port()
         self.hits = {}                       # URL -> number of requests that reached the server
+        self.last_request = {}               # URL -> request headers (lower-case) the server received
         self.lock = threading.Lock()
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", self.port))
@@ -72,6 +74,7 @@ class Origin:
             hdr = data.decode("latin1").lower()
             with self.lock:
                 self.hits[full] = self.hits.get(full, 0) + 1
+                self.last_request[full] = hdr
             send = conn.sendall
 
             def ok(extra, body):
@@ -94,6 +97,16 @@ class Origin:
                     send(b"HTTP/1.0 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: max-age=100\r\n\r\n")
                 else:
                     ok(b"ETag: \"v1\"\r\nCache-Control: max-age=0\r\n", b"v1")
+            elif path == "/etag2":               # the 304 also brings an updated header
+                if 'if-none-match: "w1"' in hdr:
+                    send(b"HTTP/1.0 304 Not Modified\r\nETag: \"w1\"\r\nX-Version: 2\r\n"
+                         b"Cache-Control: max-age=100\r\n\r\n")
+                else:
+                    ok(b"ETag: \"w1\"\r\nX-Version: 1\r\nCache-Control: max-age=0\r\n", b"w1")
+            elif path == "/cookie":
+                ok(b"Cache-Control: max-age=60\r\nSet-Cookie: session=SECRET123\r\n", b"cookie page")
+            elif path == "/age":                 # already 60 s old in another cache: stale at once
+                ok(b"Cache-Control: max-age=60\r\nAge: 60\r\n", b"already old")
             elif path == "/lastmod":
                 if "if-modified-since" in hdr:
                     send(b"HTTP/1.0 304 Not Modified\r\n\r\n")
@@ -104,7 +117,17 @@ class Origin:
             elif path == "/truncated":
                 send(b"HTTP/1.0 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 1000\r\n\r\n0123456789")
             elif path == "/chunked":
-                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nCache-Control: max-age=60\r\n\r\n"
+                     b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+            elif path == "/badchunk":
+                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nhello\r\n0\r\n\r\n")
+            elif path == "/cutchunk":
+                send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+            elif path == "/drip":                # one byte every 1.5 s: never silent, never done
+                send(b"HTTP/1.0 200 OK\r\n\r\n")
+                for _ in range(20):
+                    send(b"a")
+                    time.sleep(1.5)
             elif path == "/garbage":
                 send(b"this is not http at all")
             elif path == "/nostatus":
@@ -319,10 +342,50 @@ class CachingTests(ProxyTestCase):
         self.assertIn("CACHE MISS", log)
         self.assertIn("CACHE HIT", log)
 
+    def test_set_cookie_not_replayed_to_other_clients(self):
+        _, h1, _ = self.get("/cookie?a=1")
+        _, h2, _ = self.get("/cookie?a=1")
+        self.assertEqual(xcache(h2), "HIT")
+        self.assertTrue(any(k.lower() == "set-cookie" for k, _ in h1))        # the first client gets it
+        self.assertFalse(any(k.lower() == "set-cookie" for k, _ in h2))       # nobody else does
+
+    def test_age_header_is_respected(self):
+        self.get("/age?a=1")
+        self.assertEqual(xcache(self.get("/age?a=1")[1]), "MISS")
+
+    def test_304_updates_stored_headers(self):
+        self.get("/etag2?a=1")
+        s, h, b = self.get("/etag2?a=1")
+        self.assertEqual((xcache(h), b), ("HIT (revalidated)", b"w1"))
+        self.assertIn(("X-Version", "2"), h)
+
 
 class CacheUnitTests(unittest.TestCase):
-    def entry(self):
-        return proxy.CacheEntry(200, "OK", [("ETag", '"x"')], b"x", time.time() + 100)
+    def entry(self, n=1):
+        return proxy.CacheEntry(200, "OK", [("ETag", '"x"')], b"x" * n, time.time() + 100)
+
+    def test_byte_limit_evicts_oldest(self):
+        c = proxy.Cache(max_entries=100, max_bytes=1000)
+        c.put("a", self.entry(400)); c.put("b", self.entry(400))
+        c.put("a", self.entry(400))                 # replacing must not count the bytes twice
+        self.assertEqual(len(c), 2)
+        c.put("c", self.entry(400))                 # over 1000 bytes -> the oldest (b) goes
+        self.assertIsNone(c.get("b")); self.assertIsNotNone(c.get("a"))
+
+    def test_byte_count_follows_entry_that_grew(self):
+        c = proxy.Cache(max_entries=100, max_bytes=10**9)
+        e = self.entry(10)
+        c.put("a", e)
+        e.set_headers([("ETag", '"x"'), ("X-Long", "y" * 500)])   # e.g. headers merged from a 304
+        c.put("a", e)
+        self.assertEqual(c.size_bytes, e.size)
+
+    def test_shared_cache_rules(self):
+        now = time.time()
+        f = proxy.compute_expiry
+        self.assertAlmostEqual(f([("Cache-Control", "max-age=10, s-maxage=50")]), now + 50, delta=1)
+        self.assertAlmostEqual(f([("Cache-Control", "max-age=60"), ("Age", "20")]), now + 40, delta=1)
+        self.assertAlmostEqual(f([("Cache-Control", "max-age=-5")]), now, delta=1)
 
     def test_oldest_entry_removed_when_full(self):
         c = proxy.Cache(max_entries=2)
@@ -428,9 +491,31 @@ class ErrorHandlingTests(ProxyTestCase):
         self.alive()
 
     def test_bad_origin_responses_are_502_and_not_cached(self):
-        for p in ("/truncated", "/chunked", "/garbage", "/nostatus"):
+        for p in ("/truncated", "/badchunk", "/cutchunk", "/garbage", "/nostatus"):
             self.assertEqual(self.get(p + "?a=1")[0], 502, p)
             self.assertEqual(self.get(p + "?a=1")[0], 502, p + " (second time)")
+        self.alive()
+
+    def test_chunked_origin_is_decoded_and_cached(self):
+        s, h, b = self.get("/chunked?a=1")
+        self.assertEqual((s, b), (200, b"hello world"))
+        self.assertFalse(any(k.lower() == "transfer-encoding" for k, _ in h))
+        s, h, b = self.get("/chunked?a=1")
+        self.assertEqual((xcache(h), b), ("HIT", b"hello world"))
+
+    def test_slow_drip_origin_gets_504_in_time(self):
+        t = time.time()
+        self.assertEqual(self.get("/drip?a=1")[0], 504)
+        self.assertLess(time.time() - t, proxy.ORIGIN_TOTAL_TIMEOUT + 2)
+        self.alive()
+
+    def test_response_over_size_limit_is_502(self):
+        old = proxy.MAX_RESPONSE_SIZE if hasattr(proxy, "MAX_RESPONSE_SIZE") else None
+        proxy.MAX_RESPONSE_SIZE = 1024 * 1024
+        try:
+            self.assertEqual(self.get("/medium?limit=1")[0], 502)          # 4 MB > 1 MB limit
+        finally:
+            proxy.MAX_RESPONSE_SIZE = old
         self.alive()
 
     def test_silent_origin_gets_504(self):
@@ -451,8 +536,151 @@ class ErrorHandlingTests(ProxyTestCase):
         time.sleep(1.5)
         self.alive()
 
+    def test_loop_detection(self):
+        self.assertEqual(self.get("", raw_url=f"http://127.0.0.1:{self.port}/")[0], 508)
+        self.assertEqual(self.get("", raw_url=f"http://localhost:{self.port}/x")[0], 508)
+        self.assertEqual(self.get("/maxage?loop=1", "Via: 1.1 CachingProxy\r\n")[0], 508)
+        self.alive()
+
+    def test_forwarded_request_carries_via(self):
+        self.get("/maxage?via=1")
+        self.assertIn("via: 1.1 cachingproxy", self.origin.last_request["/maxage?via=1"])
+
+    def test_error_reply_survives_unread_request_data(self):
+        # the proxy answers before reading everything; closing must not reset (RST) the reply away
+        raw = b"GET http://a.test/ HTTP/1.1\r\nX: " + b"x" * 70000 + b"\r\n\r\n"
+        for _ in range(5):
+            self.assertEqual(self.status(raw), 400)
+
+    def test_fuzz_random_bytes_never_kill_the_proxy(self):
+        rnd = random.Random(1234)
+        base = f"GET http://127.0.0.1:{self.origin.port}/maxage?fz=1 HTTP/1.1\r\nHost: x\r\n\r\n".encode()
+        for i in range(150):
+            kind = i % 3
+            if kind == 0:                                              # pure noise
+                payload = bytes(rnd.randrange(256) for _ in range(rnd.randrange(1, 200)))
+            elif kind == 1:                                            # a valid request with bytes changed
+                b = bytearray(base)
+                for _ in range(rnd.randrange(1, 6)):
+                    b[rnd.randrange(len(b))] = rnd.randrange(256)
+                payload = bytes(b)
+            else:                                                      # a valid request cut short
+                payload = base[:rnd.randrange(1, len(base))]
+            raw_request(self.port, payload + b"\r\n\r\n", timeout=5)
+        self.alive()
+
+
+class EchoServer:
+    """Plain TCP server that sends back whatever it receives (stands in for an HTTPS site)."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.sock.listen(20)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.echo, args=(c,), daemon=True).start()
+
+    def echo(self, c):
+        try:
+            while True:
+                data = c.recv(65536)
+                if not data:
+                    break
+                c.sendall(data)
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+
+class TunnelTests(ProxyTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.echo = EchoServer()
+        cls.closed_port = free_port()                  # nothing listens here
+        proxy.CONNECT_PORTS = {443, cls.echo.port, cls.closed_port}
+
+    def open_tunnel(self, target, extra=b""):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode() + extra)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(1)
+            if not chunk:
+                break
+            head += chunk
+        return s, parse(head)[0]
+
+    def connect_status(self, target):
+        s, status = self.open_tunnel(target)
+        s.close()
+        return status
+
+    def test_tunnel_relays_bytes_both_ways(self):
+        s, status = self.open_tunnel(f"127.0.0.1:{self.echo.port}", extra=b"early ")
+        self.assertEqual(status, 200)
+        s.sendall(b"ping")
+        got = b""
+        while len(got) < 10:
+            got += s.recv(100)
+        self.assertEqual(got, b"early ping")            # bytes sent with the CONNECT are not lost
+        s.close()
+        time.sleep(0.3)
+        self.assertTrue(any(l.startswith("TUNNEL") for l in self.logs.lines))
+        self.alive()
+
+    def test_tunnel_carries_large_data(self):
+        s, status = self.open_tunnel(f"127.0.0.1:{self.echo.port}")
+        self.assertEqual(status, 200)
+        data = os.urandom(2 * 1024 * 1024)
+        threading.Thread(target=s.sendall, args=(data,), daemon=True).start()
+        got = bytearray()
+        while len(got) < len(data):
+            got += s.recv(65536)
+        self.assertEqual(bytes(got), data)
+        s.close()
+
+    def test_tunnel_errors(self):
+        self.assertEqual(self.connect_status("blocked.test:443"), 403)
+        self.assertEqual(self.connect_status("www.blocked.test.:443"), 403)
+        self.assertEqual(self.connect_status("127.0.0.1:25"), 403)                 # only allowed ports
+        self.assertEqual(self.connect_status("nohost"), 400)
+        self.assertEqual(self.connect_status("no-such-host.invalid:443"), 502)
+        self.assertEqual(self.connect_status(f"127.0.0.1:{self.closed_port}"), 502)
+        self.assertEqual(self.connect_status(f"127.0.0.1:{self.port}"), 508)       # the proxy itself
+        self.alive()
+
+    def test_client_https_through_blocked_tunnel(self):
+        r = client.fetch("https://blocked.test/", "127.0.0.1", self.port)
+        self.assertEqual((r["status"], r["cache"]), (403, "BLOCKED"))
+        self.assertEqual(client.describe_source("TUNNEL"),
+                         "HTTPS TUNNEL (encrypted end to end, never cached)")
+
 
 class ConcurrencyTests(ProxyTestCase):
+    def test_client_limit_returns_503_then_recovers(self):
+        port = free_port()
+        threading.Thread(target=proxy.serve, args=("127.0.0.1", port, self.rules, 3), daemon=True).start()
+        time.sleep(0.5)
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(3)]   # occupy all 3 slots
+        time.sleep(0.3)
+        data = raw_request(port, f"GET http://127.0.0.1:{self.origin.port}/ HTTP/1.1\r\n\r\n".encode(), timeout=5)
+        self.assertEqual(parse(data)[0], 503)
+        for s in idle:
+            s.close()
+        time.sleep(0.5)
+        data = raw_request(port, f"GET http://127.0.0.1:{self.origin.port}/x HTTP/1.1\r\n\r\n".encode(), timeout=5)
+        self.assertEqual(parse(data)[0], 200)
+
     def test_parallel_clients(self):
         results, errors = [], []
 
@@ -491,7 +719,7 @@ class ClientTests(ProxyTestCase):
         self.assertEqual(client.fetch("http://x.invalid/", "127.0.0.1", self.port)["cache"], "ERROR")
 
     def test_client_rejects_bad_urls(self):
-        for url in ("example.com", "https://example.com", "ftp://x/", "http://", ""):
+        for url in ("example.com", "ftp://x/", "http://", "https://", ""):
             with self.assertRaises(ValueError, msg=url):
                 client.fetch(url, "127.0.0.1", self.port)
 
