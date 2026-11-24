@@ -94,6 +94,16 @@ class Origin:
                     send(b"HTTP/1.0 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: max-age=100\r\n\r\n")
                 else:
                     ok(b"ETag: \"v1\"\r\nCache-Control: max-age=0\r\n", b"v1")
+            elif path == "/etag2":               # the 304 also brings an updated header
+                if 'if-none-match: "w1"' in hdr:
+                    send(b"HTTP/1.0 304 Not Modified\r\nETag: \"w1\"\r\nX-Version: 2\r\n"
+                         b"Cache-Control: max-age=100\r\n\r\n")
+                else:
+                    ok(b"ETag: \"w1\"\r\nX-Version: 1\r\nCache-Control: max-age=0\r\n", b"w1")
+            elif path == "/cookie":
+                ok(b"Cache-Control: max-age=60\r\nSet-Cookie: session=SECRET123\r\n", b"cookie page")
+            elif path == "/age":                 # already 60 s old in another cache: stale at once
+                ok(b"Cache-Control: max-age=60\r\nAge: 60\r\n", b"already old")
             elif path == "/lastmod":
                 if "if-modified-since" in hdr:
                     send(b"HTTP/1.0 304 Not Modified\r\n\r\n")
@@ -319,10 +329,50 @@ class CachingTests(ProxyTestCase):
         self.assertIn("CACHE MISS", log)
         self.assertIn("CACHE HIT", log)
 
+    def test_set_cookie_not_replayed_to_other_clients(self):
+        _, h1, _ = self.get("/cookie?a=1")
+        _, h2, _ = self.get("/cookie?a=1")
+        self.assertEqual(xcache(h2), "HIT")
+        self.assertTrue(any(k.lower() == "set-cookie" for k, _ in h1))        # the first client gets it
+        self.assertFalse(any(k.lower() == "set-cookie" for k, _ in h2))       # nobody else does
+
+    def test_age_header_is_respected(self):
+        self.get("/age?a=1")
+        self.assertEqual(xcache(self.get("/age?a=1")[1]), "MISS")
+
+    def test_304_updates_stored_headers(self):
+        self.get("/etag2?a=1")
+        s, h, b = self.get("/etag2?a=1")
+        self.assertEqual((xcache(h), b), ("HIT (revalidated)", b"w1"))
+        self.assertIn(("X-Version", "2"), h)
+
 
 class CacheUnitTests(unittest.TestCase):
-    def entry(self):
-        return proxy.CacheEntry(200, "OK", [("ETag", '"x"')], b"x", time.time() + 100)
+    def entry(self, n=1):
+        return proxy.CacheEntry(200, "OK", [("ETag", '"x"')], b"x" * n, time.time() + 100)
+
+    def test_byte_limit_evicts_oldest(self):
+        c = proxy.Cache(max_entries=100, max_bytes=1000)
+        c.put("a", self.entry(400)); c.put("b", self.entry(400))
+        c.put("a", self.entry(400))                 # replacing must not count the bytes twice
+        self.assertEqual(len(c), 2)
+        c.put("c", self.entry(400))                 # over 1000 bytes -> the oldest (b) goes
+        self.assertIsNone(c.get("b")); self.assertIsNotNone(c.get("a"))
+
+    def test_byte_count_follows_entry_that_grew(self):
+        c = proxy.Cache(max_entries=100, max_bytes=10**9)
+        e = self.entry(10)
+        c.put("a", e)
+        e.set_headers([("ETag", '"x"'), ("X-Long", "y" * 500)])   # e.g. headers merged from a 304
+        c.put("a", e)
+        self.assertEqual(c.size_bytes, e.size)
+
+    def test_shared_cache_rules(self):
+        now = time.time()
+        f = proxy.compute_expiry
+        self.assertAlmostEqual(f([("Cache-Control", "max-age=10, s-maxage=50")]), now + 50, delta=1)
+        self.assertAlmostEqual(f([("Cache-Control", "max-age=60"), ("Age", "20")]), now + 40, delta=1)
+        self.assertAlmostEqual(f([("Cache-Control", "max-age=-5")]), now, delta=1)
 
     def test_oldest_entry_removed_when_full(self):
         c = proxy.Cache(max_entries=2)
