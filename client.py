@@ -13,10 +13,12 @@ Examples
   python client.py http://example.com http://httpbin.org/get -n 2 --no-body
   python client.py http://example.com --proxy 127.0.0.1:8888 --full
   python client.py http://example.com --headers     # also print the response headers
+  python client.py https://example.com              # HTTPS through a CONNECT tunnel (never cached)
 """
 
 import argparse
 import socket
+import ssl
 import sys
 import time
 from urllib.parse import urlsplit
@@ -25,38 +27,80 @@ BUFFER_SIZE = 65536
 
 
 def fetch(url, proxy_host, proxy_port, timeout=15, no_cache=False):
-    """Send one GET request via the proxy.
-    Returns dict(status_line, status, headers, body, elapsed_ms, cache)."""
+    """Send one GET request via the proxy (http:// directly, https:// through a CONNECT tunnel).
+    Returns dict(status_line, status, headers, header_lines, body, elapsed_ms, cache)."""
     parts = urlsplit(url)
-    if parts.scheme != "http" or not parts.hostname:
-        raise ValueError("URL must look like http://host/path (HTTPS is not supported)")
-
-    lines = [
-        f"GET {url} HTTP/1.1",
-        f"Host: {parts.netloc}",
-        "User-Agent: CachingProxyClient/1.0",
-        "Accept: */*",
-    ]
-    if no_cache:                                   # ask the proxy for a fresh copy
-        lines += ["Cache-Control: no-cache", "Pragma: no-cache"]
-    lines.append("Connection: close")
-    request = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("URL must look like http://host/path or https://host/path")
 
     start = time.perf_counter()                       # start timer
     with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as s:
         s.settimeout(timeout)
-        s.sendall(request)
-        raw = bytearray()
-        while True:
-            chunk = s.recv(BUFFER_SIZE)
-            if not chunk:
-                break
-            raw += chunk
+        if parts.scheme == "https":
+            raw, cache = fetch_https(s, parts, timeout)
+        else:
+            s.sendall(build_request(f"GET {url} HTTP/1.1", parts.netloc, no_cache))
+            raw, cache = read_all(s), None
     elapsed_ms = (time.perf_counter() - start) * 1000  # stop timer
 
+    reply = parse_reply(raw)
+    reply["elapsed_ms"] = elapsed_ms
+    if cache:
+        reply["cache"] = cache
+    return reply
+
+
+def build_request(request_line, host, no_cache=False):
+    lines = [request_line, f"Host: {host}", "User-Agent: CachingProxyClient/1.0", "Accept: */*"]
+    if no_cache:                                   # ask the proxy for a fresh copy
+        lines += ["Cache-Control: no-cache", "Pragma: no-cache"]
+    lines.append("Connection: close")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
+
+
+def read_all(sock):
+    """Read until the other side closes the connection."""
+    raw = bytearray()
+    while True:
+        try:
+            chunk = sock.recv(BUFFER_SIZE)
+        except ssl.SSLEOFError:                    # some HTTPS servers close without a TLS goodbye
+            break
+        if not chunk:
+            break
+        raw += chunk
+    return bytes(raw)
+
+
+def fetch_https(sock, parts, timeout):
+    """Ask the proxy for a tunnel, then speak TLS with the web server through it.
+    The proxy only sees encrypted bytes, so the answer can never come from its cache.
+    Returns (raw response, cache tag)."""
+    port = parts.port or 443
+    target = f"[{parts.hostname}]:{port}" if ":" in parts.hostname else f"{parts.hostname}:{port}"
+    sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("iso-8859-1"))
+    head = bytearray()
+    while b"\r\n\r\n" not in head:                 # the proxy's own answer to CONNECT
+        chunk = sock.recv(BUFFER_SIZE)
+        if not chunk:
+            break
+        head += chunk
+    if parse_reply(bytes(head))["status"] != 200:  # blocked or failed: the error page is the answer
+        return bytes(head) + read_all(sock), None
+
+    context = ssl.create_default_context()         # checks the server's certificate and name
+    with context.wrap_socket(sock, server_hostname=parts.hostname) as tls:
+        tls.settimeout(timeout)
+        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        tls.sendall(build_request(f"GET {path} HTTP/1.0", parts.netloc))   # 1.0: no chunked body
+        return read_all(tls), "TUNNEL"
+
+
+def parse_reply(raw):
+    """Split a raw HTTP response into its parts."""
     if b"\r\n\r\n" not in raw:
         raise ConnectionError("proxy closed the connection without a complete response")
-    head, _, body = bytes(raw).partition(b"\r\n\r\n")
+    head, _, body = raw.partition(b"\r\n\r\n")
     lines = head.decode("iso-8859-1").split("\r\n")
     status_line = lines[0]
     headers = {}
@@ -72,7 +116,7 @@ def fetch(url, proxy_host, proxy_port, timeout=15, no_cache=False):
     return {
         "status_line": status_line, "status": status, "headers": headers,
         "header_lines": lines[1:],                    # the headers exactly as received, for --headers
-        "body": body, "elapsed_ms": elapsed_ms,
+        "body": body,
         "cache": headers.get("x-cache", "UNKNOWN"),   # the proxy says HIT, MISS, BLOCKED or ERROR
     }
 
@@ -95,12 +139,14 @@ def describe_source(cache_tag):
         return "FIREWALL (request blocked by proxy)"
     if cache_tag == "ERROR":
         return "PROXY ERROR"
+    if cache_tag == "TUNNEL":
+        return "HTTPS TUNNEL (encrypted end to end, never cached)"
     return "UNKNOWN"
 
 
 def main():
     ap = argparse.ArgumentParser(description="HTTP client that talks to the caching proxy")
-    ap.add_argument("urls", nargs="+", help="http:// URLs to request")
+    ap.add_argument("urls", nargs="+", help="http:// or https:// URLs to request")
     ap.add_argument("--proxy", default="127.0.0.1:8888", help="proxy host:port")
     ap.add_argument("-n", "--repeat", type=int, default=1, help="requests per URL")
     ap.add_argument("--no-cache", action="store_true", help="ask the proxy to bypass its cache")
