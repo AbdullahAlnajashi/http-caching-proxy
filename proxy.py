@@ -37,6 +37,8 @@ MAX_CACHEABLE_SIZE = 5 * 1024 * 1024    # responses larger than 5 MB are not cac
 MAX_CACHE_ENTRIES = 100                 # the cache keeps at most this many responses ...
 MAX_CACHE_BYTES = 100 * 1024 * 1024     # ... and at most this many bytes in total
 DEFAULT_TTL = 60                        # seconds a response stays fresh if the server gives no hint
+MAX_CLIENTS = 100                       # connections served at the same time (others get 503)
+VIA_TOKEN = "CachingProxy"              # added to forwarded requests; seeing it again means a loop
 
 log = logging.getLogger("proxy")
 
@@ -331,6 +333,7 @@ def fetch_from_origin(host, port, path, validators=None):
         "User-Agent: CachingProxy/1.0",
         "Accept: */*",
         "Accept-Encoding: identity",         # no compression, so the body stays readable
+        f"Via: 1.1 {VIA_TOKEN}",             # lets a proxy loop be detected
         "Connection: close",
     ]
     for k, v in (validators or {}).items():
@@ -393,9 +396,19 @@ def error_response(status, reason, detail=""):
 # ----------------------------------------------------------------------------
 # Handling one request
 # ----------------------------------------------------------------------------
-def handle_request(raw, cache, firewall):
-    """Return the bytes to send back to the client. Raises ProxyError on failure."""
+def is_self(host, port, listen):
+    """True if host:port is this proxy's own listening address."""
+    return port == listen[1] and host in {"localhost", "127.0.0.1", "::1", listen[0].lower()}
+
+
+def handle_request(raw, cache, firewall, listen=("127.0.0.1", 8888)):
+    """Return the bytes to send back to the client. Raises ProxyError on failure.
+    `listen` is the proxy's own (host, port), used to refuse requests that would loop."""
     url, host, port, path, req_headers = parse_request(raw)
+
+    # 0) Loop protection: a request for the proxy itself, or one this proxy already forwarded
+    if is_self(host, port, listen) or VIA_TOKEN.lower() in req_headers.get("via", "").lower():
+        raise ProxyError(508, "Loop Detected", "The proxy cannot forward a request to itself.")
 
     # 1) Firewall: blocked sites are never contacted and never served from the cache
     if firewall.is_blocked(host):
@@ -452,7 +465,44 @@ def handle_request(raw, cache, firewall):
     return build_response(status, reason, headers, body, "MISS (bypass)" if bypass else "MISS")
 
 
-def client_thread(conn, addr, cache, firewall):
+def graceful_close(conn):
+    """Close without destroying the reply we just sent.
+    Closing a socket that still holds unread client data makes TCP send a reset (RST), which can
+    wipe the reply from the client's buffer. So: send FIN, drain what is left (bounded), then close."""
+    try:
+        conn.shutdown(socket.SHUT_WR)
+        deadline, drained = time.monotonic() + 0.5, 0
+        while drained < 1024 * 1024 and time.monotonic() < deadline:
+            conn.settimeout(max(0.05, deadline - time.monotonic()))
+            chunk = conn.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            drained += len(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def refuse(conn):
+    """Answer 503 to a client we have no capacity for (runs in its own short-lived thread)."""
+    try:
+        conn.settimeout(1)
+        try:
+            conn.recv(BUFFER_SIZE)                    # read the request first so closing does not RST
+        except OSError:
+            pass
+        conn.sendall(error_response(503, "Service Unavailable", "Proxy is busy, try again."))
+    except OSError:
+        pass
+    finally:
+        graceful_close(conn)
+
+
+def client_thread(conn, addr, cache, firewall, limit, listen):
     """One thread per client connection. Every exception is caught here,
     so a bad request or a network error never stops the proxy."""
     try:
@@ -466,7 +516,7 @@ def client_thread(conn, addr, cache, firewall):
         if not raw.strip():
             return                                    # the client connected and left
         try:
-            response = handle_request(raw, cache, firewall)
+            response = handle_request(raw, cache, firewall, listen)
         except ProxyError as e:                       # expected errors: send an error page
             if e.status != 403:
                 log.error("ERROR %d      %s from %s", e.status, e.detail or e.reason, addr[0])
@@ -486,11 +536,13 @@ def client_thread(conn, addr, cache, firewall):
     except Exception as e:
         log.exception("UNEXPECTED ERROR in client thread: %s", e)
     finally:
-        conn.close()                                  # always close the client socket
+        graceful_close(conn)                          # always close the client socket
+        limit.release()                               # free this client's slot
 
 
-def serve(host, port, blocked_file):
+def serve(host, port, blocked_file, max_clients=None):
     cache, firewall = Cache(), Firewall(blocked_file)
+    limit = threading.BoundedSemaphore(max_clients or MAX_CLIENTS)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         server.bind((host, port))
@@ -506,7 +558,11 @@ def serve(host, port, blocked_file):
                 conn, addr = server.accept()
             except socket.timeout:
                 continue
-            threading.Thread(target=client_thread, args=(conn, addr, cache, firewall),
+            if not limit.acquire(blocking=False):     # too many clients: answer 503 instead
+                threading.Thread(target=refuse, args=(conn,), daemon=True).start()
+                continue
+            threading.Thread(target=client_thread,
+                             args=(conn, addr, cache, firewall, limit, (host, port)),
                              daemon=True).start()
     except KeyboardInterrupt:
         log.info("Shutting down (cache held %d entries)", len(cache))

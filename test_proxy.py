@@ -45,6 +45,7 @@ class Origin:
     def __init__(self):
         self.port = free_port()
         self.hits = {}                       # URL -> number of requests that reached the server
+        self.last_request = {}               # URL -> request headers (lower-case) the server received
         self.lock = threading.Lock()
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", self.port))
@@ -73,6 +74,7 @@ class Origin:
             hdr = data.decode("latin1").lower()
             with self.lock:
                 self.hits[full] = self.hits.get(full, 0) + 1
+                self.last_request[full] = hdr
             send = conn.sendall
 
             def ok(extra, body):
@@ -534,8 +536,55 @@ class ErrorHandlingTests(ProxyTestCase):
         time.sleep(1.5)
         self.alive()
 
+    def test_loop_detection(self):
+        self.assertEqual(self.get("", raw_url=f"http://127.0.0.1:{self.port}/")[0], 508)
+        self.assertEqual(self.get("", raw_url=f"http://localhost:{self.port}/x")[0], 508)
+        self.assertEqual(self.get("/maxage?loop=1", "Via: 1.1 CachingProxy\r\n")[0], 508)
+        self.alive()
+
+    def test_forwarded_request_carries_via(self):
+        self.get("/maxage?via=1")
+        self.assertIn("via: 1.1 cachingproxy", self.origin.last_request["/maxage?via=1"])
+
+    def test_error_reply_survives_unread_request_data(self):
+        # the proxy answers before reading everything; closing must not reset (RST) the reply away
+        raw = b"GET http://a.test/ HTTP/1.1\r\nX: " + b"x" * 70000 + b"\r\n\r\n"
+        for _ in range(5):
+            self.assertEqual(self.status(raw), 400)
+
+    def test_fuzz_random_bytes_never_kill_the_proxy(self):
+        rnd = random.Random(1234)
+        base = f"GET http://127.0.0.1:{self.origin.port}/maxage?fz=1 HTTP/1.1\r\nHost: x\r\n\r\n".encode()
+        for i in range(150):
+            kind = i % 3
+            if kind == 0:                                              # pure noise
+                payload = bytes(rnd.randrange(256) for _ in range(rnd.randrange(1, 200)))
+            elif kind == 1:                                            # a valid request with bytes changed
+                b = bytearray(base)
+                for _ in range(rnd.randrange(1, 6)):
+                    b[rnd.randrange(len(b))] = rnd.randrange(256)
+                payload = bytes(b)
+            else:                                                      # a valid request cut short
+                payload = base[:rnd.randrange(1, len(base))]
+            raw_request(self.port, payload + b"\r\n\r\n", timeout=5)
+        self.alive()
+
 
 class ConcurrencyTests(ProxyTestCase):
+    def test_client_limit_returns_503_then_recovers(self):
+        port = free_port()
+        threading.Thread(target=proxy.serve, args=("127.0.0.1", port, self.rules, 3), daemon=True).start()
+        time.sleep(0.5)
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(3)]   # occupy all 3 slots
+        time.sleep(0.3)
+        data = raw_request(port, f"GET http://127.0.0.1:{self.origin.port}/ HTTP/1.1\r\n\r\n".encode(), timeout=5)
+        self.assertEqual(parse(data)[0], 503)
+        for s in idle:
+            s.close()
+        time.sleep(0.5)
+        data = raw_request(port, f"GET http://127.0.0.1:{self.origin.port}/x HTTP/1.1\r\n\r\n".encode(), timeout=5)
+        self.assertEqual(parse(data)[0], 200)
+
     def test_parallel_clients(self):
         results, errors = [], []
 
