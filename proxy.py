@@ -3,12 +3,14 @@
 HTTP Proxy Server with Caching and Firewall
 -------------------------------------------
 Features
-  * Handles HTTP GET requests sent by a client to the proxy (GET http://host/path HTTP/1.1)
-  * In-memory cache driven by HTTP headers (Cache-Control, Expires, ETag, Last-Modified),
-    with revalidation of stale copies (If-None-Match / If-Modified-Since -> 304 Not Modified)
+  * Forwards HTTP GET requests (GET http://host/path HTTP/1.1) and tunnels HTTPS (CONNECT host:443)
+  * Shared cache driven by HTTP headers (Cache-Control incl. s-maxage, Age, Expires, ETag,
+    Last-Modified), LRU-bounded by entries and bytes, with revalidation of stale copies
+    (If-None-Match / If-Modified-Since -> 304 Not Modified); Set-Cookie is never stored
   * Firewall: blocks the domains listed in blocked_domains.txt with 403 Forbidden
-  * Logs every CACHE HIT / CACHE MISS / BLOCKED / ERROR to the console and to proxy.log
-  * Exception handling: an error in one request never stops the proxy
+  * Logs every CACHE HIT / CACHE MISS / BLOCKED / TUNNEL / ERROR to the console and to proxy.log
+  * Robust: chunked decoding, transfer deadline and size cap, loop detection, a client limit
+    (503), and an error in one request never stops the proxy
 
 Usage:  python proxy.py [--host 127.0.0.1] [--port 8888] [--blocked blocked_domains.txt]
 """
